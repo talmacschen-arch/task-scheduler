@@ -1,0 +1,9 @@
+# 运行时生成物
+logs/
+run/
+
+# 实际任务配置（保留 conf/tasks.conf.example 作为模板）
+conf/tasks.conf
+
+# Claude Code 本地设置（含本机绝对路径，不入库）
+.claude/settings.local.json

@@ -1,0 +1,46 @@
+#=============================================================================
+# 任务调度配置文件
+#
+# 格式：
+#   分钟 小时 日 月 星期  任务名  脚本路径
+#
+# cron 字段支持：
+#   *       任意值
+#   */N     每隔N
+#   N       固定值
+#   N,M     多个值
+#   N-M     范围
+#
+# 任务链（线性执行，失败即终止）：
+#   chain 链名
+#     分钟 小时 日 月 星期  任务名  脚本路径    （链首任务，带调度时间）
+#     >>                    任务名  脚本路径    （后续任务，上一个成功后执行）
+#   end
+#=============================================================================
+
+# === 独立任务 ===
+
+# 每天凌晨2:30执行数据库备份测试
+30 2 * * *  backup_test  /opt/scripts/backup_test.sh
+
+# 每周一早上8点执行性能测试
+0  8 * * 1  perf_test    /opt/scripts/perf_test.py
+
+# 每隔6小时执行连接池测试
+0  */6 * * *  conn_pool_test  /opt/scripts/conn_pool_test.sh
+
+# === 任务链 ===
+
+# 每天早上6点执行完整功能测试链（默认失败终止）
+chain daily_func_check
+  0 6 * * *  func_test_basic    /opt/scripts/func_test_basic.sh
+  >>         func_test_crud     /opt/scripts/func_test_crud.sh
+  >>         func_test_txn      /opt/scripts/func_test_txn.py
+end
+
+# 每晚10点执行独立测试项（失败继续，互不影响）
+chain nightly_independent continue_on_failure
+  0 22 * * *  test_readonly   /opt/scripts/test_readonly.sh
+  >>          test_backup     /opt/scripts/test_backup.sh
+  >>          test_restore    /opt/scripts/test_restore.sh
+end

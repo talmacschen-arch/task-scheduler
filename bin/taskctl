@@ -1,0 +1,446 @@
+#!/bin/bash
+#=============================================================================
+# taskctl - 任务调度系统 CLI 工具
+#
+# 用法：
+#   taskctl <command> [options]
+#
+# 环境变量：
+#   TASK_SCHEDULER_HOME  指定安装目录（可选，默认自动检测）
+#=============================================================================
+
+VERSION="1.0.0"
+
+# ---- 定位项目根目录 ----
+if [[ -n "${TASK_SCHEDULER_HOME}" ]]; then
+    PROJECT_DIR="${TASK_SCHEDULER_HOME}"
+else
+    TASKCTL_DIR="$(cd "$(dirname "$0")" && pwd)"
+    PROJECT_DIR="$(dirname "${TASKCTL_DIR}")"
+fi
+
+# ---- 加载环境配置 ----
+ENV_CONF="${PROJECT_DIR}/env.conf"
+if [[ -f "${ENV_CONF}" ]]; then
+    source "${ENV_CONF}"
+fi
+
+# 设置默认值（env.conf 中的变量可覆盖）
+TASK_CONFIG="${TASK_CONFIG:-conf/tasks.conf}"
+TASK_LOG_DIR="${TASK_LOG_DIR:-logs}"
+TASK_RUN_DIR="${TASK_RUN_DIR:-run}"
+TASK_LOG_RETAIN_DAYS="${TASK_LOG_RETAIN_DAYS:-31}"
+TASK_LOG_CLEANUP_INTERVAL="${TASK_LOG_CLEANUP_INTERVAL:-21600}"
+TASK_POLL_INTERVAL="${TASK_POLL_INTERVAL:-60}"
+TASK_DEFAULT_TIMEOUT="${TASK_DEFAULT_TIMEOUT:-0}"
+TASK_LOG_LEVEL="${TASK_LOG_LEVEL:-1}"
+TASK_PYTHON3="${TASK_PYTHON3:-python3}"
+
+# 转为绝对路径
+_resolve_path() {
+    local path="$1"
+    if [[ "${path}" != /* ]]; then
+        echo "${PROJECT_DIR}/${path}"
+    else
+        echo "${path}"
+    fi
+}
+
+DEFAULT_CONFIG="$(_resolve_path "${TASK_CONFIG}")"
+ABS_LOG_DIR="$(_resolve_path "${TASK_LOG_DIR}")"
+ABS_RUN_DIR="$(_resolve_path "${TASK_RUN_DIR}")"
+
+# ---- 加载 scheduler 模块 ----
+source "${PROJECT_DIR}/lib/scheduler.sh"
+
+# 将 env.conf 的参数传递给各模块
+_apply_env_config() {
+    LOG_RETAIN_DAYS="${TASK_LOG_RETAIN_DAYS}"
+    LOG_CLEANUP_INTERVAL="${TASK_LOG_CLEANUP_INTERVAL}"
+    SCHEDULER_POLL_INTERVAL="${TASK_POLL_INTERVAL}"
+    EXECUTOR_DEFAULT_TIMEOUT="${TASK_DEFAULT_TIMEOUT}"
+    CURRENT_LOG_LEVEL="${TASK_LOG_LEVEL}"
+}
+
+# 初始化调度器并应用配置
+_init() {
+    scheduler_init "${PROJECT_DIR}"
+    _apply_env_config
+}
+
+#-----------------------------------------------------------------------------
+# _usage - 显示帮助信息
+#-----------------------------------------------------------------------------
+_usage() {
+    cat << EOF
+taskctl v${VERSION} - 任务调度系统 CLI 工具
+
+用法：
+  taskctl <command> [options]
+
+命令：
+  start [-c config] [-f]     启动调度器
+                              -c  指定配置文件（默认 conf/tasks.conf）
+                              -f  前台运行（默认后台 daemon）
+  stop                       停止调度器
+  status                     查看调度器状态
+  running                    查看当前正在运行的任务
+  run <task_name>            手动触发任务（链任务则触发整条链）
+  list [-c config]           列出所有已配置的任务
+  log <task_name> [N]        查看任务最近 N 次执行日志（默认 1）
+  cleanup                    手动清理过期日志
+  check <cron_expr>          检查 cron 表达式是否匹配当前时间
+  version                    显示版本信息
+  help                       显示此帮助信息
+
+环境变量：
+  TASK_SCHEDULER_HOME        安装根目录（默认自动检测）
+
+配置文件：
+  env.conf                   环境参数配置（路径、日志保留天数等）
+  conf/tasks.conf            任务调度配置
+
+示例：
+  taskctl start                        # 使用默认配置启动
+  taskctl start -c /path/to/my.conf    # 指定配置文件
+  taskctl start -f                     # 前台运行（调试用）
+  taskctl stop                         # 停止调度器
+  taskctl running                      # 查看当前运行中的任务
+  taskctl run backup_test              # 手动执行 backup_test
+  taskctl list                         # 查看所有任务
+  taskctl log backup_test 5            # 查看最近 5 次日志
+  taskctl check "*/5 * * * *"          # 测试 cron 表达式
+EOF
+}
+
+#-----------------------------------------------------------------------------
+# cmd_start - 启动调度器
+#-----------------------------------------------------------------------------
+cmd_start() {
+    local config_file="${DEFAULT_CONFIG}"
+    local mode="daemon"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c)
+                config_file="$2"
+                shift 2
+                ;;
+            -f)
+                mode="foreground"
+                shift
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    # 转为绝对路径
+    if [[ "${config_file}" != /* ]]; then
+        config_file="$(cd "$(dirname "${config_file}")" 2>/dev/null && pwd)/$(basename "${config_file}")"
+    fi
+
+    if [[ ! -f "${config_file}" ]]; then
+        echo "Config file not found: ${config_file}" >&2
+        echo "Run 'bash install.sh' or copy conf/tasks.conf.example to conf/tasks.conf" >&2
+        return 1
+    fi
+
+    _init
+    scheduler_start "${config_file}" "${mode}"
+}
+
+#-----------------------------------------------------------------------------
+# cmd_stop - 停止调度器
+#-----------------------------------------------------------------------------
+cmd_stop() {
+    _init
+    scheduler_stop
+}
+
+#-----------------------------------------------------------------------------
+# cmd_status - 查看状态
+#-----------------------------------------------------------------------------
+cmd_status() {
+    _init
+
+    if [[ -f "${DEFAULT_CONFIG}" ]]; then
+        config_load "${DEFAULT_CONFIG}" 2>/dev/null
+    fi
+
+    scheduler_status
+}
+
+#-----------------------------------------------------------------------------
+# cmd_running - 查看当前正在运行的任务
+#-----------------------------------------------------------------------------
+cmd_running() {
+    local status_file="${ABS_RUN_DIR}/current_task.info"
+
+    if [[ ! -f "${status_file}" ]]; then
+        echo "No task is currently running."
+        return 0
+    fi
+
+    # 读取状态文件
+    local task_name="" task_pid="" task_script="" task_start_ts="" task_start_time=""
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            TASK_NAME)       task_name="${value}" ;;
+            TASK_PID)        task_pid="${value}" ;;
+            TASK_SCRIPT)     task_script="${value}" ;;
+            TASK_START_TS)   task_start_ts="${value}" ;;
+            TASK_START_TIME) task_start_time="${value}" ;;
+        esac
+    done < "${status_file}"
+
+    # 验证进程是否仍然存活
+    if [[ -n "${task_pid}" && "${task_pid}" -ne 0 ]] && kill -0 "${task_pid}" 2>/dev/null; then
+        local now_ts
+        now_ts=$(date '+%s')
+        local elapsed=$(( now_ts - task_start_ts ))
+
+        # 格式化耗时
+        local hours=$(( elapsed / 3600 ))
+        local mins=$(( (elapsed % 3600) / 60 ))
+        local secs=$(( elapsed % 60 ))
+        local elapsed_str
+        if [[ ${hours} -gt 0 ]]; then
+            elapsed_str="${hours}h${mins}m${secs}s"
+        elif [[ ${mins} -gt 0 ]]; then
+            elapsed_str="${mins}m${secs}s"
+        else
+            elapsed_str="${secs}s"
+        fi
+
+        echo "Currently running task:"
+        echo "----------------------------------------------------------------------"
+        echo "  Name:       ${task_name}"
+        echo "  PID:        ${task_pid}"
+        echo "  Script:     ${task_script}"
+        echo "  Started:    ${task_start_time}"
+        echo "  Elapsed:    ${elapsed_str}"
+        echo "----------------------------------------------------------------------"
+    else
+        # 进程已结束但状态文件未清理（异常情况）
+        echo "No task is currently running."
+        rm -f "${status_file}" 2>/dev/null
+    fi
+
+    return 0
+}
+
+#-----------------------------------------------------------------------------
+# cmd_run - 手动触发任务
+#-----------------------------------------------------------------------------
+cmd_run() {
+    local task_name="$1"
+
+    if [[ -z "${task_name}" ]]; then
+        echo "Usage: taskctl run <task_name>" >&2
+        return 1
+    fi
+
+    _init
+
+    local config_file="${DEFAULT_CONFIG}"
+    if [[ ! -f "${config_file}" ]]; then
+        echo "Config file not found: ${config_file}" >&2
+        return 1
+    fi
+
+    config_load "${config_file}"
+    scheduler_run_task "${task_name}"
+}
+
+#-----------------------------------------------------------------------------
+# cmd_list - 列出所有任务
+#-----------------------------------------------------------------------------
+cmd_list() {
+    local config_file="${DEFAULT_CONFIG}"
+
+    # 支持 -c 指定配置
+    if [[ "$1" == "-c" && -n "$2" ]]; then
+        config_file="$2"
+    fi
+
+    _init
+
+    if [[ ! -f "${config_file}" ]]; then
+        echo "Config file not found: ${config_file}" >&2
+        return 1
+    fi
+
+    config_load "${config_file}"
+
+    local task_count=${#TASKS[@]}
+    local chain_count=${#CHAINS[@]}
+
+    echo "Config: ${config_file}"
+    echo ""
+    echo "Tasks (${task_count}):"
+    echo "----------------------------------------------------------------------"
+    printf "  %-18s %-15s %-8s %s\n" "NAME" "CRON" "CHAIN" "SCRIPT"
+    echo "----------------------------------------------------------------------"
+
+    local task
+    for task in "${TASKS[@]}"; do
+        local name cron script chain
+        name=$(echo "${task}" | cut -d'|' -f1)
+        cron=$(echo "${task}" | cut -d'|' -f2)
+        script=$(echo "${task}" | cut -d'|' -f3)
+        chain=$(echo "${task}" | cut -d'|' -f4)
+
+        if [[ "${cron}" == "chain_follow" ]]; then
+            cron="  >>"
+        fi
+
+        printf "  %-18s %-15s %-8s %s\n" "${name}" "${cron}" "${chain:--}" "${script}"
+    done
+
+    if [[ ${chain_count} -gt 0 ]]; then
+        echo ""
+        echo "Chains (${chain_count}):"
+        echo "----------------------------------------------------------------------"
+        printf "  %-18s %-12s %s\n" "NAME" "ON_FAILURE" "TASKS"
+        echo "----------------------------------------------------------------------"
+
+        local chain
+        for chain in "${CHAINS[@]}"; do
+            local cname tasks policy
+            cname=$(echo "${chain}" | cut -d'|' -f1)
+            tasks=$(echo "${chain}" | cut -d'|' -f2)
+            policy=$(echo "${chain}" | cut -d'|' -f3)
+            printf "  %-18s %-12s %s\n" "${cname}" "${policy}" "${tasks}"
+        done
+    fi
+}
+
+#-----------------------------------------------------------------------------
+# cmd_log - 查看任务执行日志
+#-----------------------------------------------------------------------------
+cmd_log() {
+    local task_name="$1"
+    local count="${2:-1}"
+
+    if [[ -z "${task_name}" ]]; then
+        echo "Usage: taskctl log <task_name> [count]" >&2
+        return 1
+    fi
+
+    local log_dir="${ABS_LOG_DIR}/tasks/${task_name}"
+
+    if [[ ! -d "${log_dir}" ]]; then
+        echo "No logs found for task: ${task_name}" >&2
+        return 1
+    fi
+
+    local log_files
+    mapfile -t log_files < <(ls -t "${log_dir}"/*.log 2>/dev/null)
+
+    if [[ ${#log_files[@]} -eq 0 ]]; then
+        echo "No log files found for task: ${task_name}" >&2
+        return 1
+    fi
+
+    local total=${#log_files[@]}
+    echo "Task '${task_name}': ${total} log(s) total, showing latest ${count}"
+    echo ""
+
+    local i=0
+    for log_file in "${log_files[@]}"; do
+        [[ ${i} -ge ${count} ]] && break
+
+        local filename
+        filename=$(basename "${log_file}")
+        echo "--- [${filename}] ---"
+        cat "${log_file}"
+        echo ""
+
+        i=$(( i + 1 ))
+    done
+    return 0
+}
+
+#-----------------------------------------------------------------------------
+# cmd_cleanup - 手动清理过期日志
+#-----------------------------------------------------------------------------
+cmd_cleanup() {
+    _init
+    echo "Cleaning up logs older than ${LOG_RETAIN_DAYS} days..."
+    task_log_cleanup
+    echo "Done."
+}
+
+#-----------------------------------------------------------------------------
+# cmd_check - 检查 cron 表达式
+#-----------------------------------------------------------------------------
+cmd_check() {
+    local cron_expr="$1"
+
+    if [[ -z "${cron_expr}" ]]; then
+        echo "Usage: taskctl check <cron_expr>" >&2
+        echo "Example: taskctl check \"*/5 * * * *\"" >&2
+        return 1
+    fi
+
+    local now
+    now=$(date '+%Y-%m-%d %H:%M')
+
+    echo "Cron expression: ${cron_expr}"
+    echo "Current time:    ${now}"
+
+    if ${TASK_PYTHON3} "${PROJECT_DIR}/lib/cron_match.py" "${cron_expr}" "${now}"; then
+        echo "Result:          MATCH"
+    else
+        local rc=$?
+        if [[ ${rc} -eq 1 ]]; then
+            echo "Result:          NO MATCH"
+        else
+            echo "Result:          ERROR (invalid expression)" >&2
+            return 1
+        fi
+    fi
+}
+
+#-----------------------------------------------------------------------------
+# cmd_version - 显示版本信息
+#-----------------------------------------------------------------------------
+cmd_version() {
+    echo "taskctl v${VERSION}"
+    echo "Home: ${PROJECT_DIR}"
+    echo "Config: ${DEFAULT_CONFIG}"
+    echo "Logs: ${ABS_LOG_DIR}"
+    echo "PID: ${ABS_RUN_DIR}/scheduler.pid"
+}
+
+#-----------------------------------------------------------------------------
+# 主入口
+#-----------------------------------------------------------------------------
+main() {
+    local command="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "${command}" in
+        start)    cmd_start "$@" ;;
+        stop)     cmd_stop ;;
+        status)   cmd_status ;;
+        running)  cmd_running ;;
+        run)      cmd_run "$@" ;;
+        list)     cmd_list "$@" ;;
+        log)      cmd_log "$@" ;;
+        cleanup)  cmd_cleanup ;;
+        check)    cmd_check "$@" ;;
+        version|--version|-v)  cmd_version ;;
+        help|--help|-h)        _usage ;;
+        *)
+            echo "Unknown command: ${command}" >&2
+            echo "Run 'taskctl help' for usage." >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
