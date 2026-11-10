@@ -1,5 +1,7 @@
 # Task Scheduler - 任务调度系统
 
+[English](README.en.md) | **中文**
+
 一个轻量级的定时任务调度系统，用于在 OpenClaw 终端上定时执行数据库功能测试和性能测试脚本。
 
 ## 特性
